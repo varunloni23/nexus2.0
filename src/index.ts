@@ -30,7 +30,24 @@ const corsOptions = {
 };
 
 const io = new Server(server, {
-  cors: corsOptions
+  cors: corsOptions,
+  allowEIO3: true,
+  transports: ['websocket', 'polling'],
+  pingTimeout: 60000,
+  pingInterval: 25000,
+  upgradeTimeout: 30000,
+  maxHttpBufferSize: 1e6,
+  allowRequest: (req, callback) => {
+    // Enhanced request validation and logging
+    const origin = req.headers.origin;
+    const userAgent = req.headers['user-agent'];
+    
+    console.log(`🔌 WebSocket connection attempt from origin: ${origin}`);
+    console.log(`🔌 User Agent: ${userAgent}`);
+    
+    // Allow all origins for now (you can restrict this later)
+    callback(null, true);
+  }
 });
 
 // Middleware
@@ -306,25 +323,142 @@ const broadcastData = () => {
 
 // Socket.IO connection handling
 io.on('connection', (socket) => {
-  console.log('Client connected:', socket.id);
+  const clientInfo = {
+    id: socket.id,
+    ip: socket.handshake.address,
+    origin: socket.handshake.headers.origin,
+    userAgent: socket.handshake.headers['user-agent'],
+    timestamp: new Date().toISOString()
+  };
   
-  // Send latest data immediately upon connection
+  console.log('🔌 Client connected:', JSON.stringify(clientInfo, null, 2));
+  console.log(`📊 Total connected clients: ${io.engine.clientsCount}`);
+  
+  // Send welcome message and latest data immediately upon connection
+  socket.emit('connection_confirmed', {
+    message: 'Connected to CementAI Nexus Backend',
+    server_time: new Date().toISOString(),
+    your_id: socket.id
+  });
+  
   if (latestDashboardData) {
+    console.log(`📤 Sending latest dashboard data to client: ${socket.id}`);
     socket.emit('dashboard_update', latestDashboardData);
   }
   
-  socket.on('disconnect', () => {
-    console.log('Client disconnected:', socket.id);
+  // Handle disconnection
+  socket.on('disconnect', (reason) => {
+    console.log(`🔌 Client disconnected: ${socket.id}`);
+    console.log(`📊 Disconnect reason: ${reason}`);
+    console.log(`📊 Remaining connected clients: ${io.engine.clientsCount}`);
+  });
+  
+  // Handle connection errors
+  socket.on('error', (error) => {
+    console.error(`🔌 Socket error for client ${socket.id}:`, error);
   });
   
   // Handle client requests for specific data
   socket.on('request_sensor_data', () => {
-    socket.emit('sensor_data', simulator.generateSensorReadings());
+    console.log(`📊 Client ${socket.id} requested sensor data`);
+    try {
+      const sensorData = simulator.generateSensorReadings();
+      socket.emit('sensor_data', sensorData);
+      console.log(`📤 Sent ${sensorData.length} sensor readings to client: ${socket.id}`);
+    } catch (error) {
+      console.error(`❌ Error generating sensor data for client ${socket.id}:`, error);
+      socket.emit('error', { message: 'Failed to generate sensor data' });
+    }
   });
   
   socket.on('request_process_data', () => {
-    socket.emit('process_data', simulator.generateProcessParameters());
+    console.log(`📊 Client ${socket.id} requested process data`);
+    try {
+      const processData = simulator.generateProcessParameters();
+      socket.emit('process_data', processData);
+      console.log(`📤 Sent process data to client: ${socket.id}`);
+    } catch (error) {
+      console.error(`❌ Error generating process data for client ${socket.id}:`, error);
+      socket.emit('error', { message: 'Failed to generate process data' });
+    }
   });
+  
+  // Handle ping/pong for connection health
+  socket.on('ping', () => {
+    console.log(`🏓 Ping received from client: ${socket.id}`);
+    socket.emit('pong');
+  });
+  
+  // Handle client status requests
+  socket.on('request_status', () => {
+    socket.emit('server_status', {
+      connected_clients: io.engine.clientsCount,
+      server_time: new Date().toISOString(),
+      simulation_running: simulator.isRunning(),
+      uptime: process.uptime()
+    });
+  });
+});
+
+// WebSocket Debug and Status Endpoints
+app.get('/api/websocket/status', (req, res) => {
+  try {
+    const socketInfo = {
+      connected_clients: io.engine.clientsCount,
+      server_time: new Date().toISOString(),
+      socket_io_version: require('socket.io/package.json').version,
+      transport_types: ['websocket', 'polling'],
+      cors_origins: [
+        'http://localhost:3000',
+        'https://cement-nexus-ai.vercel.app',
+        'https://cement-nexus-ai.onrender.com',
+        process.env.FRONTEND_URL
+      ].filter(Boolean),
+      ping_timeout: 60000,
+      ping_interval: 25000,
+      upgrade_timeout: 30000
+    };
+    
+    res.json({
+      success: true,
+      websocket_status: 'active',
+      data: socketInfo,
+      timestamp: new Date()
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: 'Failed to get WebSocket status',
+      timestamp: new Date()
+    });
+  }
+});
+
+app.get('/api/websocket/test', (req, res) => {
+  try {
+    // Send a test broadcast to all connected clients
+    const testData = {
+      test: true,
+      message: 'WebSocket test broadcast from REST endpoint',
+      timestamp: new Date().toISOString(),
+      connected_clients: io.engine.clientsCount
+    };
+    
+    io.emit('test_broadcast', testData);
+    
+    res.json({
+      success: true,
+      message: 'Test broadcast sent to all connected WebSocket clients',
+      broadcast_data: testData,
+      timestamp: new Date()
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: 'Failed to send test broadcast',
+      timestamp: new Date()
+    });
+  }
 });
 
 // REST API Endpoints
@@ -532,24 +666,13 @@ app.post('/api/simulation/anomaly', (req, res) => {
 app.post('/api/ai/chat', async (req, res) => {
   try {
     const { message } = req.body;
-    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-    console.log('📨 /api/ai/chat endpoint received request');
-    console.log('💬 Question received:', message);
-    console.log('📊 Dashboard data available:', !!latestDashboardData);
-    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-    
     const response = await geminiService.askGemini(message, latestDashboardData);
-    
-    console.log('✅ Response generated, sending back to client');
-    console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
-    
     res.json({
       success: true,
       data: response,
       timestamp: new Date()
     });
   } catch (error) {
-    console.error('❌ Error in /api/ai/chat:', error);
     res.status(500).json({
       success: false,
       error: 'Failed to process AI request',
